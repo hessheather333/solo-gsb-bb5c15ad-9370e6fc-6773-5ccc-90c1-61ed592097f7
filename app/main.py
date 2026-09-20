@@ -5,13 +5,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic_core import PydanticCustomError
 
-from . import approvals, logic
+from . import approvals, logic, settlements
 from .db import init_db
 from .timeutil import iso
 
@@ -20,13 +21,14 @@ from .timeutil import iso
 async def lifespan(app: FastAPI):
     init_db()  # 启动时自动建表
     approvals.init_table()  # 审批模块独立建表（幂等）
+    settlements.init_table()  # 结算批次模块独立建表（幂等）
     yield
 
 
 app = FastAPI(
     title="合同费率双时态追溯 API",
-    version="1.8.0",
-    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史；版本血缘以可审计的 supersedes / retained_from 边记录；结算期费率锁保证锁定窗口内费率不再被修订；费率修订预演（不写库）签发 state_token，POST /rates 携带 token 条件提交，保证预演与正式提交结果一致；最惠价合规审计按同一认知时点比较目标与同业合同费率，逐段判定 compliant / violation / inconclusive（全程只读）；费率修订审批模块在独立表上提供申请创建（复用预演、区间互斥）、审核（expected_revision 乐观锁）与执行（同事务条件提交、token 陈旧保留 approved、重复执行幂等）。",
+    version="1.9.0",
+    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史；版本血缘以可审计的 supersedes / retained_from 边记录；结算期费率锁保证锁定窗口内费率不再被修订；费率修订预演（不写库）签发 state_token，POST /rates 携带 token 条件提交，保证预演与正式提交结果一致；最惠价合规审计按同一认知时点比较目标与同业合同费率，逐段判定 compliant / violation / inconclusive（全程只读）；费率修订审批模块在独立表上提供申请创建（复用预演、区间互斥）、审核（expected_revision 乐观锁）与执行（同事务条件提交、token 陈旧保留 approved、重复执行幂等）；结算批次模块复用计费预览的区间切分与全覆盖校验，通过后在独立表原子保存不可变快照，Idempotency-Key 提供创建幂等（同键异请求 409）。",
     lifespan=lifespan,
 )
 
@@ -427,6 +429,47 @@ class RevisionApprovalListResponse(BaseModel):
     approvals: list[RevisionApprovalView]
 
 
+# ---------- 结算批次（独立模块/表，不可变快照 + 幂等键） ----------
+
+class SettlementBatchCreate(BaseModel):
+    known_at: Optional[datetime] = Field(
+        default=None, description="认知时点，缺省为当前时间；不得晚于当前时间"
+    )
+    lines: list[ChargeLineIn] = Field(min_length=1, description="账单行列表，至少一条")
+
+
+class SettlementRequestLineView(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from", description="规范化账单行起点（含）")
+    to: str = Field(description="规范化账单行终点（不含）")
+    base_amount: float
+
+
+class SettlementRequestView(BaseModel):
+    known_at: str = Field(description="实际使用的认知时点（规范化 UTC ISO 字符串）")
+    lines: list[SettlementRequestLineView]
+
+
+class SettlementBatchView(BaseModel):
+    batch_id: int
+    contract_no: str
+    idempotency_key: str = Field(description="创建时携带的幂等键")
+    created_at: str = Field(description="快照写入时间（审计用）")
+    total_amount: float = Field(description="全部行费用合计")
+    lines: list[ChargeLineView] = Field(
+        description="各行金额（line_total）与逐段费率依据（rate_id/rate/charge/portion）"
+    )
+    request: SettlementRequestView = Field(description="创建时冻结的规范化请求快照")
+
+
+class SettlementBatchResponse(BaseModel):
+    batch: SettlementBatchView
+    idempotent: bool = Field(
+        description="True=相同幂等键且请求一致的重放，返回首次快照；False=首次创建"
+    )
+
+
 def to_view(row: sqlite3.Row) -> VersionView:
     return VersionView(
         rate_id=row["id"],
@@ -482,6 +525,19 @@ def to_coverage_segment(seg: dict) -> CoverageSegment:
         status=seg["status"],
         basis=to_view(seg["candidates"][0]) if seg["status"] == "covered" else None,
         candidates=[to_view(r) for r in seg["candidates"]] if seg["status"] == "conflict" else [],
+    )
+
+
+def to_batch_view(outcome: dict) -> SettlementBatchView:
+    snapshot = outcome["snapshot"]
+    return SettlementBatchView(
+        batch_id=outcome["batch_id"],
+        contract_no=outcome["contract_no"],
+        idempotency_key=outcome["idempotency_key"],
+        created_at=outcome["created_at"],
+        total_amount=snapshot["total_amount"],
+        lines=[ChargeLineView(**line) for line in snapshot["lines"]],
+        request=SettlementRequestView(**snapshot["request"]),
     )
 
 
@@ -1107,3 +1163,121 @@ def list_revision_approvals(
         contract_no=contract_no,
         approvals=[to_approval_view(r) for r in rows],
     )
+
+
+# ---------- 结算批次（独立模块/表，不可变快照 + 幂等键） ----------
+
+@app.post(
+    "/contracts/{contract_no}/settlement-batches",
+    response_model=SettlementBatchResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_settlement_batch(
+    contract_no: str,
+    payload: SettlementBatchCreate,
+    response: Response,
+    idempotency_key: Annotated[
+        str,
+        Header(
+            alias="Idempotency-Key",
+            min_length=1,
+            max_length=200,
+            description="必填幂等键：相同键且请求一致回放首次快照；相同键但请求不同返回 409",
+        ),
+    ],
+):
+    """创建结算批次。
+
+    复用计费预览（POST /charge-preview）的区间切分、全覆盖校验与逐段计价：
+    把每条账单行按 known_at 可见费率的业务边界拆分计价，**任一行出现 gap /
+    conflict 片段时整批拒绝（409 SETTLEMENT_BATCH_UNSAFE）、不落库**（响应附
+    与计费预览同构的逐行明细）。全部行可计价时，在**独立表** settlement_batches
+    中**原子保存不可变快照**：规范化请求（known_at + 账单行）、逐段费率依据
+    （rate_id / rate / charge / portion）、各行金额（line_total）与总额。
+
+    必须携带 `Idempotency-Key` 请求头（幂等命名空间按合同隔离）：
+    - 相同键且规范化请求一致：回放首次保存的快照，`idempotent=true`
+      （HTTP 200，不再计价、不重新落库；即使此后费率已修订也返回历史快照）；
+    - 相同键但请求不同：`409 IDEMPOTENCY_KEY_REUSED`，不覆盖首次快照；
+    - 新键且校验通过：创建新快照，`idempotent=false`（HTTP 201）。
+    """
+    if not idempotency_key.strip():
+        # 与缺头/请求体校验失败同一口径：交由全局 RequestValidationError 处理器，
+        # 返回顶层 {"code": "INVALID_REQUEST", ...}。
+        raise RequestValidationError(
+            [PydanticCustomError(
+                "blank_header",
+                "Idempotency-Key 请求头不得为空白",
+            )]
+        )
+    try:
+        outcome = settlements.create_batch(
+            contract_no=contract_no,
+            lines=[
+                (line.from_, line.to, line.base_amount) for line in payload.lines
+            ],
+            known_at=payload.known_at,
+            idempotency_key=idempotency_key,
+        )
+    except settlements.IdempotencyKeyReusedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "IDEMPOTENCY_KEY_REUSED",
+                "message": str(exc),
+                "existing_batch_id": exc.existing_batch_id,
+            },
+        )
+    except settlements.SettlementUnsafeError as exc:
+        preview = exc.preview
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "SETTLEMENT_BATCH_UNSAFE",
+                "message": str(exc),
+                "contract_no": contract_no,
+                "known_at": preview["known_at"],
+                "total_amount": None,
+                "lines": preview["lines"],
+            },
+        )
+    except logic.InvalidIntervalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_INTERVAL", "message": str(exc)},
+        )
+    except logic.InvalidAmountError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_AMOUNT", "message": str(exc)},
+        )
+    except logic.FutureKnownAtError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_KNOWN_AT", "message": str(exc)},
+        )
+    if outcome["idempotent"]:
+        # 幂等重放：非创建语义，返回 200；首次创建保持 201。
+        response.status_code = status.HTTP_200_OK
+    return SettlementBatchResponse(
+        batch=to_batch_view(outcome["batch"]),
+        idempotent=outcome["idempotent"],
+    )
+
+
+@app.get(
+    "/contracts/{contract_no}/settlement-batches/{batch_id}",
+    response_model=SettlementBatchResponse,
+)
+def get_settlement_batch(contract_no: str, batch_id: int):
+    """查询结算批次快照（不可变，只追加）：返回创建时冻结的规范化请求、逐段费率依据、
+    各行金额与总额；查询语义恒为 `idempotent=false`。批次不存在（或不属于路径合同）
+    返回 404 SETTLEMENT_BATCH_NOT_FOUND。"""
+    try:
+        outcome = settlements.get_batch(contract_no, batch_id)
+    except settlements.SettlementBatchNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "SETTLEMENT_BATCH_NOT_FOUND", "message": str(exc)},
+        )
+    return SettlementBatchResponse(batch=to_batch_view(outcome), idempotent=False)

@@ -2745,3 +2745,352 @@ def test_approval_malformed_requests_422(client):
                         action="approve", expected_revision=0)
     assert r.status_code == 422
     assert r.json()["code"] == "INVALID_REQUEST"
+
+
+# ---------- 结算批次 ----------
+
+def post_batch(client, contract, key="key-1", **kw):
+    headers = {"Idempotency-Key": key} if key is not None else {}
+    return client.post(f"/contracts/{contract}/settlement-batches",
+                       json=kw, headers=headers)
+
+
+def get_batch(client, contract, batch_id):
+    return client.get(f"/contracts/{contract}/settlement-batches/{batch_id}")
+
+
+def _batch_payload(base=10000.0, frm="2026-01-01T00:00:00Z",
+                   to="2027-01-01T00:00:00Z", known_at="2026-06-01T00:00:00Z"):
+    return {"known_at": known_at,
+            "lines": [{"from": frm, "to": to, "base_amount": base}]}
+
+
+def test_settlement_batch_create_saves_immutable_snapshot(client):
+    """全覆盖时 201 创建：快照含规范化请求、逐段费率依据、各行金额与总额。"""
+    post_rate(client, contract_no="SB-1", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z", reason="全年费率")
+    r = post_batch(client, "SB-1", **_batch_payload())
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["idempotent"] is False
+    batch = body["batch"]
+    assert batch["batch_id"] == 1
+    assert batch["contract_no"] == "SB-1"
+    assert batch["idempotency_key"] == "key-1"
+    assert batch["created_at"]
+    assert set(batch) == {"batch_id", "contract_no", "idempotency_key",
+                         "created_at", "total_amount", "lines", "request"}
+    assert batch["total_amount"] == 500.0
+    (line,) = batch["lines"]
+    assert line["status"] == "ok" and line["line_total"] == 500.0
+    (seg,) = line["segments"]
+    assert (seg["from"], seg["to"], seg["status"], seg["portion"],
+            seg["rate_id"], seg["rate"], seg["charge"], seg["candidates"]) == (
+        "2026-01-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00",
+        "covered", 1.0, 1, 0.05, 500.0, [])
+    # 规范化请求
+    assert batch["request"]["known_at"] == "2026-06-01T00:00:00.000000+00:00"
+    (req_line,) = batch["request"]["lines"]
+    assert req_line == {"from": "2026-01-01T00:00:00.000000+00:00",
+                        "to": "2027-01-01T00:00:00.000000+00:00",
+                        "base_amount": 10000.0}
+
+
+def test_settlement_batch_multiple_lines_and_segments_total(client):
+    """多行、行内多段切分：逐段费率依据完整，各行金额与总额汇总与计费预览同口径。"""
+    post_rate(client, contract_no="SB-2", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="SB-2", rate=0.08,
+              valid_from="2026-07-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    payload = {"known_at": "2026-02-01T00:00:00Z", "lines": [
+        {"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z", "base_amount": 1000.0},
+        {"from": "2026-01-01T00:00:00Z", "to": "2026-07-01T00:00:00Z", "base_amount": 730.0},
+    ]}
+    r = post_batch(client, "SB-2", key="multi", **payload)
+    assert r.status_code == 201, r.text
+    batch = r.json()["batch"]
+    l1, l2 = batch["lines"]
+    assert [(s["rate_id"], s["rate"]) for s in l1["segments"]] == [(1, 0.05), (2, 0.08)]
+    assert l1["line_total"] == round(
+        sum(s["charge"] for s in l1["segments"]), 6)
+    assert l2["segments"][0]["rate_id"] == 1
+    assert l2["line_total"] == round(730.0 * 0.05, 6)
+    assert batch["total_amount"] == round(l1["line_total"] + l2["line_total"], 6)
+    assert batch["total_amount"] == round(
+        sum(s["charge"] for ln in batch["lines"] for s in ln["segments"]), 6)
+    # 规范化请求保留两行原顺序
+    assert [ln["base_amount"] for ln in batch["request"]["lines"]] == [1000.0, 730.0]
+
+
+def test_settlement_batch_idempotent_replay_returns_first_snapshot(client):
+    """同键且请求一致：200 + idempotent=true，返回与首次完全相同的快照。"""
+    post_rate(client, contract_no="SB-3", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    payload = _batch_payload(base=2000.0)
+    first = post_batch(client, "SB-3", key="idem-1", **payload)
+    assert first.status_code == 201
+    assert first.json()["idempotent"] is False
+
+    again = post_batch(client, "SB-3", key="idem-1", **payload)
+    assert again.status_code == 200, again.text
+    assert again.json()["idempotent"] is True
+    assert again.json()["batch"] == first.json()["batch"]
+
+    # 只落一行快照
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT id, total_amount FROM settlement_batches "
+            "WHERE contract_no = 'SB-3'").fetchall()
+    assert rows == [(1, 100.0)]
+
+    # GET 取回同一快照（查询语义 idempotent=false）
+    got = get_batch(client, "SB-3", 1)
+    assert got.status_code == 200
+    assert got.json()["idempotent"] is False
+    assert got.json()["batch"] == first.json()["batch"]
+
+
+def test_settlement_batch_replay_survives_later_rate_revision(client):
+    """重放在此后费率已修订时仍返回首次快照（历史计价不可变）。"""
+    post_rate(client, contract_no="SB-4", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="SB-4", rate=0.08,
+              valid_from="2026-07-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    payload = {"known_at": "2026-02-01T00:00:00Z", "lines": [
+        {"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+         "base_amount": 1000.0}]}
+    first = post_batch(client, "SB-4", key="frozen", **payload).json()["batch"]
+
+    # 更晚认知时点修订下半年费率
+    post_rate(client, contract_no="SB-4", rate=0.20,
+              valid_from="2026-07-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-08-01T00:00:00Z")
+    replay = post_batch(client, "SB-4", key="frozen", **payload)
+    assert replay.status_code == 200
+    assert replay.json()["idempotent"] is True
+    assert replay.json()["batch"] == first
+    # 逐段费率依据仍是首次的 0.05 / 0.08，而非修订后的 0.20
+    assert [(s["rate"], s["charge"]) for s in
+            replay.json()["batch"]["lines"][0]["segments"]] == [
+        (s["rate"], s["charge"])
+        for s in first["lines"][0]["segments"]]
+
+
+def test_settlement_batch_same_key_different_request_409(client):
+    """同键但请求不同：409 IDEMPOTENCY_KEY_REUSED 并附 existing_batch_id，不覆盖快照。"""
+    post_rate(client, contract_no="SB-5", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    first = post_batch(client, "SB-5", key="dup",
+                       **_batch_payload(base=1000.0)).json()["batch"]
+
+    # 基准金额不同
+    r = post_batch(client, "SB-5", key="dup", **_batch_payload(base=2000.0))
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "IDEMPOTENCY_KEY_REUSED"
+    assert detail["existing_batch_id"] == first["batch_id"]
+
+    # 区间不同
+    r = post_batch(client, "SB-5", key="dup", **_batch_payload(
+        frm="2026-02-01T00:00:00Z", to="2026-03-01T00:00:00Z", base=1000.0))
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+
+    # known_at 不同（规范化请求不一致）
+    r = post_batch(client, "SB-5", key="dup",
+                   **_batch_payload(base=1000.0, known_at="2026-05-01T00:00:00Z"))
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+
+    # 首次快照原样可查
+    got = get_batch(client, "SB-5", 1)
+    assert got.json()["batch"]["total_amount"] == 50.0
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM settlement_batches WHERE contract_no = 'SB-5'"
+        ).fetchone()[0] == 1
+
+
+def test_settlement_batch_gap_rejects_and_persists_nothing(client):
+    """任一行出现 gap：409 SETTLEMENT_BATCH_UNSAFE（附逐行明细），整批不落库。"""
+    post_rate(client, contract_no="SB-6", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-02-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    # 第一行含 gap，第二行完全 covered
+    payload = {"known_at": "2026-03-01T00:00:00Z", "lines": [
+        {"from": "2026-01-15T00:00:00Z", "to": "2026-03-01T00:00:00Z", "base_amount": 900.0},
+        {"from": "2026-01-01T00:00:00Z", "to": "2026-01-02T00:00:00Z", "base_amount": 100.0},
+    ]}
+    r = post_batch(client, "SB-6", key="gap", **payload)
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "SETTLEMENT_BATCH_UNSAFE"
+    assert detail["contract_no"] == "SB-6"
+    assert detail["known_at"] == "2026-03-01T00:00:00.000000+00:00"
+    assert detail["total_amount"] is None
+    gap_line, ok_line = detail["lines"]
+    assert gap_line["status"] == "gap"
+    assert gap_line["line_total"] is None
+    assert [s["status"] for s in gap_line["segments"]] == ["covered", "gap"]
+    # 未受影响的行仍返回计价结果（与计费预览同口径）
+    assert ok_line["status"] == "ok" and ok_line["line_total"] == 5.0
+    # 不落任何批次
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM settlement_batches").fetchone()[0] == 0
+    # 失败后用相同键重试（改为全覆盖请求）仍可创建：键未被失败占用
+    ok = post_batch(client, "SB-6", key="gap",
+                    **_batch_payload(frm="2026-01-01T00:00:00Z",
+                                    to="2026-01-02T00:00:00Z",
+                                    known_at="2026-03-01T00:00:00Z",
+                                    base=100.0))
+    assert ok.status_code == 201
+
+
+def test_settlement_batch_conflict_rejects_with_candidates(client):
+    """任一行出现 conflict（脏数据）：409 且 conflict 段附全部候选，不落库。"""
+    post_rate(client, contract_no="SB-7", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO rate_versions "
+            "(contract_no, rate, valid_from, valid_to, recorded_at, version) "
+            "VALUES ('SB-7', 0.99, '2026-01-02T00:00:00.000000+00:00', "
+            "        '2026-01-04T00:00:00.000000+00:00', "
+            "        '2026-01-01T00:00:00.000000+00:00', 2)")
+    payload = {"known_at": "2026-02-01T00:00:00Z", "lines": [
+        {"from": "2026-01-01T00:00:00Z", "to": "2026-01-05T00:00:00Z", "base_amount": 400.0}]}
+    r = post_batch(client, "SB-7", key="conf", **payload)
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "SETTLEMENT_BATCH_UNSAFE"
+    (line,) = detail["lines"]
+    assert line["status"] == "conflict"
+    conflict = line["segments"][1]
+    assert conflict["status"] == "conflict"
+    assert [(c["rate_id"], c["rate"], c["version"]) for c in conflict["candidates"]] == [
+        (1, 0.05, 1), (2, 0.99, 2)]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM settlement_batches").fetchone()[0] == 0
+
+
+def test_settlement_batch_unknown_contract_is_gap_409(client):
+    """合同不存在 → 整行 gap → 409 SETTLEMENT_BATCH_UNSAFE，而非创建批次。"""
+    r = post_batch(client, "GHOST", key="ghost", **_batch_payload(
+        frm="2026-01-01T00:00:00Z", to="2026-02-01T00:00:00Z"))
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "SETTLEMENT_BATCH_UNSAFE"
+    (line,) = detail["lines"]
+    assert [s["status"] for s in line["segments"]] == ["gap"]
+
+
+def test_settlement_batch_requires_idempotency_key_header(client):
+    """缺少 / 空白 Idempotency-Key 请求头：422 INVALID_REQUEST。"""
+    post_rate(client, contract_no="SB-8", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    r = client.post("/contracts/SB-8/settlement-batches", json=_batch_payload())
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+    r = client.post("/contracts/SB-8/settlement-batches", json=_batch_payload(),
+                    headers={"Idempotency-Key": "   "})
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+
+
+def test_settlement_batch_validation_422(client):
+    """区间 / 金额 / 未来认知时点 / 空账单行：与计费预览同一套 422 错误码。"""
+    post_rate(client, contract_no="SB-9", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    r = post_batch(client, "SB-9", key="v1",
+                   lines=[{"from": "2026-02-01T00:00:00Z",
+                           "to": "2026-01-01T00:00:00Z", "base_amount": 1.0}])
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "INVALID_INTERVAL"
+    r = post_batch(client, "SB-9", key="v2",
+                   lines=[{"from": "2026-01-01T00:00:00Z",
+                           "to": "2026-02-01T00:00:00Z", "base_amount": -1.0}])
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "INVALID_AMOUNT"
+    r = post_batch(client, "SB-9", key="v3", known_at="2999-01-01T00:00:00Z",
+                   lines=[{"from": "2026-01-01T00:00:00Z",
+                           "to": "2026-02-01T00:00:00Z", "base_amount": 1.0}])
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "INVALID_KNOWN_AT"
+    r = post_batch(client, "SB-9", key="v4", lines=[])
+    assert r.status_code == 422 and r.json()["code"] == "INVALID_REQUEST"
+    r = post_batch(client, "SB-9", key="v5",
+                   lines=[{"from": "not-a-date",
+                           "to": "2026-02-01T00:00:00Z", "base_amount": 1.0}])
+    assert r.status_code == 422 and r.json()["code"] == "INVALID_REQUEST"
+    # 校验失败不占用幂等键：同键随后可正常创建
+    ok = post_batch(client, "SB-9", key="v1", **_batch_payload(base=100.0))
+    assert ok.status_code == 201
+
+
+def test_settlement_batch_key_scoped_per_contract(client):
+    """幂等键命名空间按合同隔离：不同合同使用相同键各自创建，互不影响。"""
+    post_rate(client, contract_no="SB-A", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="SB-B", rate=0.10,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    p = _batch_payload(base=100.0)
+    ra = post_batch(client, "SB-A", key="shared", **p)
+    rb = post_batch(client, "SB-B", key="shared", **p)
+    assert ra.status_code == 201 and rb.status_code == 201
+    assert ra.json()["batch"]["total_amount"] == 5.0
+    assert rb.json()["batch"]["total_amount"] == 10.0
+    # 各自重放只命中本合同的首次快照
+    ra2 = post_batch(client, "SB-A", key="shared", **p)
+    assert ra2.status_code == 200 and ra2.json()["batch"]["total_amount"] == 5.0
+
+
+def test_settlement_batch_get_not_found_and_contract_mismatch(client):
+    """批次不存在或不属于路径合同：404 SETTLEMENT_BATCH_NOT_FOUND。"""
+    post_rate(client, contract_no="SB-C", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_batch(client, "SB-C", key="one", **_batch_payload())
+    r = get_batch(client, "SB-C", 9999)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "SETTLEMENT_BATCH_NOT_FOUND"
+    # 批次属于别的合同：同样 404（不泄露存在性）
+    r = get_batch(client, "OTHER", 1)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "SETTLEMENT_BATCH_NOT_FOUND"
+
+
+def test_settlement_batch_known_at_visibility_and_default(client):
+    """known_at 决定可见版本；缺省 known_at 取当前时间。"""
+    # 全年费率，修订记录在 6 月
+    post_rate(client, contract_no="SB-D", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="SB-D", rate=0.08,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-06-01T00:00:00Z")
+    line = {"from": "2026-01-01T00:00:00Z", "to": "2026-02-01T00:00:00Z",
+            "base_amount": 100.0}
+    old = post_batch(client, "SB-D", key="old", known_at="2026-03-01T00:00:00Z",
+                     lines=[line])
+    assert old.json()["batch"]["total_amount"] == 5.0
+    new = post_batch(client, "SB-D", key="new", known_at="2026-07-01T00:00:00Z",
+                     lines=[line])
+    assert new.json()["batch"]["total_amount"] == 8.0
+    # 缺省 known_at：修订已可见 → 0.08
+    default = post_batch(client, "SB-D", key="now", lines=[line])
+    assert default.status_code == 201
+    assert default.json()["batch"]["total_amount"] == 8.0
+    assert default.json()["batch"]["request"]["known_at"]

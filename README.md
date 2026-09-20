@@ -101,6 +101,31 @@ docker compose up --build
   尝试语义，但需重新创建申请获取新令牌）；对已 `executed` 的申请**重复执行幂等**，
   回放首次结果（`idempotent=true`），不重复写费率。
 
+**结算批次（v1.9 起）**：`POST /contracts/{contract_no}/settlement-batches` 把一批
+账单行按指定认知时点 `known_at` 正式结算。它**复用第 5 节计费预览的区间切分、全覆盖
+校验与逐段计价**（完全同一规则）：每条账单行按该时点可见费率的业务边界拆分，逐段
+按 `base_amount × (段时长 / 行时长) × 命中费率` 折算；**任一行出现 `gap` /
+`conflict` 片段时整批拒绝（`409 SETTLEMENT_BATCH_UNSAFE`）、不落库**（响应附与计费
+预览同构的逐行逐段明细，未受影响的行仍给出计价结果）。全部行可计价时，在**独立表**
+`settlement_batches`（独立模块 `settlements.py`，只追加、不修改、不删除）的**单一
+事务**中保存一行**不可变快照**：规范化请求（`known_at` + 全部账单行）、**逐段费率
+依据**（每段的 `rate_id` / `rate` / `portion` / `charge`）、各行金额
+（`line_total`）与**总额**（`total_amount`）。此后即使费率被修订，历史快照也不改变。
+
+创建时**必须携带 `Idempotency-Key` 请求头**（幂等命名空间按合同隔离）：
+
+| 情形 | 结果 |
+|---|---|
+| 新键 + 校验通过 | `201`，`idempotent=false`，写入新快照 |
+| 相同键 + 规范化请求一致（重试） | `200`，`idempotent=true`，**回放首次快照**（不再计价、不重新落库；此后费率已修订也返回历史快照） |
+| 相同键 + 请求不同 | `409 IDEMPOTENCY_KEY_REUSED`（附 `existing_batch_id`），首次快照原样保留 |
+| 任一行 gap / conflict | `409 SETTLEMENT_BATCH_UNSAFE`，**整批不落库**（键不被失败占用） |
+| 缺 / 空白 `Idempotency-Key` | `422 INVALID_REQUEST` |
+
+`GET /contracts/{contract_no}/settlement-batches/{batch_id}` 按 id 取回不可变快照
+（不存在或不属于路径合同返回 `404 SETTLEMENT_BATCH_NOT_FOUND`）。
+
+
 **最惠价合规审计（v1.7 起）**：`POST /contracts/{contract_no}/most-favored-audit`
 按**同一认知时点** `known_at` 读取目标合同与若干同业合同的可见费率，以**所有合同
 业务边界的并集**把审计窗口 `[from, to)` 切为连续片段：目标与全部同业均唯一覆盖时，
@@ -771,6 +796,140 @@ curl "http://localhost:8000/contracts/HT-2026-001/revision-approvals?status=pend
 `422 INVALID_REQUEST`。合同无任何申请（含合同不存在）时返回
 `{"contract_no": ..., "approvals": []}`，不报 404。
 
+### 13. 结算批次 — `/contracts/{contract_no}/settlement-batches`
+
+把一批账单行正式结算落为**不可变快照**，独立表 `settlement_batches`（启动时自动
+建表），不改动费率、锁与审批数据。计价规则与第 5 节计费预览**完全一致**（同一
+区间切分与全覆盖校验、同样 6 位小数口径）。
+
+#### 13.1 创建结算批次 — `POST .../settlement-batches`
+
+```bash
+curl -X POST http://localhost:8000/contracts/HT-2026-001/settlement-batches \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: settle-2026-Q2-0001' \
+  -d '{
+        "known_at": "2026-06-01T00:00:00Z",
+        "lines": [
+          {"from": "2026-01-01T00:00:00Z", "to": "2026-07-01T00:00:00Z", "base_amount": 10000.0},
+          {"from": "2026-07-01T00:00:00Z", "to": "2027-01-01T00:00:00Z", "base_amount": 12000.0}
+        ]
+      }'
+```
+
+- 请求体与计费预览一致：`known_at`（可选，缺省当前时间，不得晚于当前时间）与
+  `lines`（至少一条；每行 `from` / `to` / `base_amount`）。
+- **必填 `Idempotency-Key` 请求头**（1–200 字符；HTTP 头名大小写不敏感）。
+  幂等命名空间按合同隔离：不同合同可复用相同键。
+- 服务端复用计费预览逐行切分计价：全部行均 `covered` 时，在**单一事务**写入
+  快照——规范化请求 `request`、逐段费率依据（`segments[]` 中的 `rate_id` /
+  `rate` / `portion` / `charge`）、各行金额 `line_total` 与总额 `total_amount`。
+- **任一行出现 `gap`（含合同不存在、版本在该认知时点尚不可见）或 `conflict`
+  （重叠脏数据）片段时整批拒绝**：`409 SETTLEMENT_BATCH_UNSAFE`，响应 `detail`
+  与计费预览响应同构（`known_at` / `total_amount: null` / 逐行 `lines`），
+  **不落任何批次**；失败也**不占用**幂等键。
+- 快照不可变：批次只追加，没有修改/删除接口；快照保存的是结算时点看到的费率
+  版本与金额，**之后费率修订不影响历史批次**。
+
+幂等语义（规范化请求指时间统一为 UTC、账单行保持原顺序后的请求）：
+
+| 情形 | 状态码 | 响应 |
+|---|---|---|
+| 新键且全部行可计价 | 201 | `idempotent=false` + 新快照 |
+| 相同键、相同规范化请求（网络重试） | 200 | `idempotent=true`，返回**首次快照**（不再计价，即使此后费率已修订） |
+| 相同键、不同请求（金额/区间/known_at/行数任一不同） | 409 | `IDEMPOTENCY_KEY_REUSED`（附 `existing_batch_id`） |
+
+校验规则：
+
+| 情形 | 状态码 | `code` |
+|---|---|---|
+| 整批全部 covered，快照已写入 | 201 / 重放 200 | — |
+| 任一行含 gap / conflict | 409 | `SETTLEMENT_BATCH_UNSAFE`（附逐行明细） |
+| 相同幂等键但请求不同 | 409 | `IDEMPOTENCY_KEY_REUSED` |
+| 账单行 `from >= to` | 422 | `INVALID_INTERVAL` |
+| `base_amount` 为负或非有限数值 | 422 | `INVALID_AMOUNT` |
+| `known_at` 晚于当前时间 | 422 | `INVALID_KNOWN_AT` |
+| 缺 / 空白 `Idempotency-Key`、`lines` 为空、时间格式非法 | 422 | `INVALID_REQUEST` |
+
+响应示例（首次创建；跨行版本边界时各行 `segments[]` 给出逐段依据）：
+
+```json
+{
+  "idempotent": false,
+  "batch": {
+    "batch_id": 1,
+    "contract_no": "HT-2026-001",
+    "idempotency_key": "settle-2026-Q2-0001",
+    "created_at": "2026-09-20T10:00:00.000000+00:00",
+    "total_amount": 1216.0,
+    "lines": [
+      {"from": "2026-01-01T00:00:00.000000+00:00", "to": "2026-07-01T00:00:00.000000+00:00",
+       "base_amount": 10000.0, "status": "ok", "line_total": 520.0,
+       "segments": [
+         {"from": "2026-01-01T00:00:00.000000+00:00", "to": "2026-07-01T00:00:00.000000+00:00",
+          "status": "covered", "portion": 1.0, "rate_id": 1, "rate": 0.052,
+          "charge": 520.0, "candidates": []}]},
+      {"from": "2026-07-01T00:00:00.000000+00:00", "to": "2027-01-01T00:00:00.000000+00:00",
+       "base_amount": 12000.0, "status": "ok", "line_total": 696.0,
+       "segments": [
+         {"from": "2026-07-01T00:00:00.000000+00:00", "to": "2027-01-01T00:00:00.000000+00:00",
+          "status": "covered", "portion": 1.0, "rate_id": 2, "rate": 0.058,
+          "charge": 696.0, "candidates": []}]}
+    ],
+    "request": {
+      "known_at": "2026-06-01T00:00:00.000000+00:00",
+      "lines": [
+        {"from": "2026-01-01T00:00:00.000000+00:00", "to": "2026-07-01T00:00:00.000000+00:00",
+         "base_amount": 10000.0},
+        {"from": "2026-07-01T00:00:00.000000+00:00", "to": "2027-01-01T00:00:00.000000+00:00",
+         "base_amount": 12000.0}
+      ]
+    }
+  }
+}
+```
+
+整批拒绝示例（账单行延伸到无费率区间；`detail` 与计费预览响应同构）：
+
+```json
+{
+  "detail": {
+    "code": "SETTLEMENT_BATCH_UNSAFE",
+    "message": "合同 'HT-2026-001' 的结算批次在认知时点 ... 存在 gap/conflict 账单行，整批拒绝且不落库",
+    "contract_no": "HT-2026-001",
+    "known_at": "2026-06-01T00:00:00.000000+00:00",
+    "total_amount": null,
+    "lines": [
+      {"from": "...", "to": "...", "base_amount": 900.0, "status": "gap",
+       "line_total": null,
+       "segments": [{"status": "covered", "...": "..."}, {"status": "gap", "...": "..."}]}
+    ]
+  }
+}
+```
+
+幂等键复用示例：
+
+```json
+{
+  "detail": {
+    "code": "IDEMPOTENCY_KEY_REUSED",
+    "message": "幂等键 'settle-2026-Q2-0001' 已用于合同 'HT-2026-001' 的结算批次 batch_id=1，但本次请求与首次请求不一致，请使用新的幂等键或与首次请求保持一致",
+    "existing_batch_id": 1
+  }
+}
+```
+
+#### 13.2 查询结算批次 — `GET .../settlement-batches/{batch_id}`
+
+```bash
+curl http://localhost:8000/contracts/HT-2026-001/settlement-batches/1
+```
+
+返回与创建成功响应同构的快照（外层恒为 `{"batch": ..., "idempotent": false}`；
+`idempotent` 仅在创建接口上为重放标记）。批次不存在、或批次不属于路径中的合同，
+均返回 `404 SETTLEMENT_BATCH_NOT_FOUND`（不泄露存在性）。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -784,14 +943,16 @@ pytest                 # 运行测试
 
 ```
 app/
-  main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、修订预演与条件提交、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG、结算期费率锁、最惠价合规审计）
-  approvals.py 费率修订审批模块（申请创建/区间互斥、expected_revision 审核、同事务执行与幂等重放）
-  db.py        SQLite 连接与自动建表（rate_versions + rate_version_edges 血缘边 + rate_locks 费率锁）
-  timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
+  main.py        FastAPI 路由与请求/响应模型
+  logic.py       双时态核心逻辑（追加式录入、修订预演与条件提交、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG、结算期费率锁、最惠价合规审计）
+  approvals.py   费率修订审批模块（申请创建/区间互斥、expected_revision 审核、同事务执行与幂等重放）
+  settlements.py 结算批次模块（复用计费预览的切分与全覆盖校验、独立表不可变快照、Idempotency-Key 幂等）
+  db.py          SQLite 连接与自动建表（rate_versions + rate_version_edges 血缘边 + rate_locks 费率锁）
+  timeutil.py    UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py
 Dockerfile / docker-compose.yml
 ```
 
-审批表 `rate_revision_approvals` 由 `approvals.init_table()` 在建库流程中幂等创建，
+审批表 `rate_revision_approvals` 由 `approvals.init_table()`、结算批次表
+`settlement_batches` 由 `settlements.init_table()` 在建库流程中幂等创建，
 Docker Compose 一键启动（`docker compose up --build`）行为不变。
