@@ -20,6 +20,9 @@ supersedes 边，补偿片段对其来源旧版本建立 retained_from 边；边
 同业合同的可见费率，以全部业务边界的并集切分审计窗口：目标与所有同业均唯一
 覆盖时，以同业最低费率为 benchmark 判定 compliant / violation；任一合同出现
 gap / conflict 时判 inconclusive 并列出原因，绝不错判合规。审计全程只读。
+
+结算批次（settlements 模块）复用 compute_charge_preview 的区间切分与全覆盖
+校验（可传入事务内连接），并把通过时的计费结果冻结为不可变快照。
 """
 
 import base64
@@ -941,24 +944,15 @@ def compute_changes(
 CHARGE_SCALE = 6
 
 
-def compute_charge_preview(
-    contract_no: str,
+def _normalize_charge_request(
     lines: list[tuple[datetime, datetime, float]],
     known_at: Optional[datetime],
-) -> dict:
-    """计费预览：把每条账单行 [from, to) 按 known_at 可见费率的业务边界拆分，
-    每段费用 = base_amount × (段时长 / 行时长) × 命中费率，行内汇总为 line_total，
-    全部行再汇总为 total_amount。
+) -> tuple[str, list[tuple[str, str, float]]]:
+    """规范化计费请求的 known_at 与账单行；计费预览与结算批次共用同一校验口径。
 
-    任一行出现 gap（无费率）或 conflict（重叠冲突）片段时，该行 line_total 置 None，
-    且整体拒绝汇总（ok=False、total_amount=None）；未受影响的行仍正常计价。
-
-    lines 为 (from, to, base_amount) 三元组。返回
-    {"known_at", "ok", "total_amount", "lines": [...]}；每个 line 为
-    {"from", "to", "base_amount", "status", "line_total", "segments"}，
-    行状态为 ok / gap / conflict / mixed（同时含 gap 与 conflict 段）；
-    每个 segment 为 {"from", "to", "status", "portion", "rate_id", "rate",
-    "charge", "candidates"}。
+    known_at 缺省为当前时间，且不得晚于当前时间；逐行校验 base_amount 非负有限、
+    区间 from < to（先 known_at、后逐行，错误优先级两模块一致）。
+    返回 (实际使用的 known_at, [(from, to, base_amount), ...])，时间均为等宽 ISO 字符串。
     """
     ka = iso(known_at) if known_at is not None else now_iso()
     if ka > now_iso():
@@ -973,6 +967,31 @@ def compute_charge_preview(
         if f >= t:
             raise InvalidIntervalError(f"账单行区间非法：from={f} 必须早于 to={t}")
         normalized.append((f, t, base_amount))
+    return ka, normalized
+
+
+def compute_charge_preview(
+    contract_no: str,
+    lines: list[tuple[datetime, datetime, float]],
+    known_at: Optional[datetime],
+    conn: Optional[sqlite3.Connection] = None,
+) -> dict:
+    """计费预览：把每条账单行 [from, to) 按 known_at 可见费率的业务边界拆分，
+    每段费用 = base_amount × (段时长 / 行时长) × 命中费率，行内汇总为 line_total，
+    全部行再汇总为 total_amount。
+
+    任一行出现 gap（无费率）或 conflict（重叠冲突）片段时，该行 line_total 置 None，
+    且整体拒绝汇总（ok=False、total_amount=None）；未受影响的行仍正常计价。
+
+    lines 为 (from, to, base_amount) 三元组。传入 conn 时复用该连接读取可见版本
+    （结算批次在事务内调用，保证校验与落库基于同一快照），否则自行开连接。返回
+    {"known_at", "ok", "total_amount", "lines": [...]}；每个 line 为
+    {"from", "to", "base_amount", "status", "line_total", "segments"}，
+    行状态为 ok / gap / conflict / mixed（同时含 gap 与 conflict 段）；
+    每个 segment 为 {"from", "to", "status", "portion", "rate_id", "rate",
+    "charge", "candidates"}。
+    """
+    ka, normalized = _normalize_charge_request(lines, known_at)
 
     out_lines = []
     total = 0.0
@@ -982,7 +1001,7 @@ def compute_charge_preview(
         segments = []
         flags = set()
         line_total = 0.0
-        for seg in _visible_segments(contract_no, f, t, ka):
+        for seg in _visible_segments(contract_no, f, t, ka, conn=conn):
             portion = _duration_us(seg["from"], seg["to"]) / line_us
             view = {
                 "from": seg["from"],
